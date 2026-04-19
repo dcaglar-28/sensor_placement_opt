@@ -1,17 +1,56 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-wheel-metadata/
 
-# Environments
+# Virtual environments
 .venv/
-env/
 venv/
+env/
 ENV/
 
-# Testing
+# Experiment outputs
+results/
+mlruns/
+
+# Isaac Sim / Omniverse
+*.usd
+*.usda
+*.usdc
+*.usdz
+omni_logs/
+_isaac_sim/
+kit/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Test / coverage
 .pytest_cache/
 .coverage
+htmlcov/
+coverage.xml
 
-# macOS files
-.DS_Store
+# Secrets
+.env
+*.pem
+*.key
+secrets.yaml
