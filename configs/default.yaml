@@ -30,6 +30,10 @@ sensor_budget:
 
 sensor_models:
   lidar:
+    # Optional: used by `scripts/isaaclab_sensor_bridge.py` to move sensor prims in USD.
+    # Set `prim_path` in your actual Isaac stage (often includes `{env_idx}` for cloned envs).
+    isaac:
+      prim_path: ""
     model_name: "Velodyne VLP-16"
     cost_usd: 4000
     range_m: 100.0
@@ -44,6 +48,8 @@ sensor_models:
     latency_ms: 20.0
 
   camera:
+    isaac:
+      prim_path: ""
     model_name: "Intel RealSense D435i"
     cost_usd: 200
     range_m: 10.0
