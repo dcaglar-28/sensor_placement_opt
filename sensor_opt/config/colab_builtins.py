@@ -160,6 +160,10 @@ def _read_str_safety(
 
 def _apply_sensor_budget_from_env(raw: RepoDict) -> None:
     """If SENSOR_*_MAX / SENSOR_*_MIN are set, copy into `sensor_budget` (Colab)."""
+    # NOTE: `apply_safety_guards_experiment_config()` now performs the env-var merge
+    # directly at the start (and also applies additional validation). Keep this helper
+    # as a no-op for backwards compatibility with older call sites.
+    return
     sb = raw.get("sensor_budget")
     if not isinstance(sb, dict):
         return
@@ -189,6 +193,33 @@ def apply_safety_guards_experiment_config(raw: RepoDict) -> None:
     In-place: enforce ranges and required keys after prompts or external edits
     so `prepare_experiment_config` and the bridge do not see broken values.
     """
+    for key in ("lidar", "camera", "radar"):
+        env_max = os.environ.get(f"SENSOR_{key.upper()}_MAX")
+        env_min = os.environ.get(f"SENSOR_{key.upper()}_MIN")
+        if env_max is not None or env_min is not None:
+            raw.setdefault("sensor_budget", {}).setdefault(key, {})
+            if env_max is not None:
+                raw["sensor_budget"][key]["usermax"] = int(env_max)
+                # keep max_count in sync if it exists
+                if "max_count" in raw["sensor_budget"][key]:
+                    raw["sensor_budget"][key]["max_count"] = int(env_max)
+            if env_min is not None:
+                raw["sensor_budget"][key]["min_count"] = int(env_min)
+
+    # At least one sensor type must have usermax >= 1
+    budget = raw.get("sensor_budget", {})
+    if all(budget.get(k, {}).get("usermax", 0) == 0 for k in ("lidar", "camera", "radar")):
+        print(
+            "[sensor_placement_opt] sensor_budget: all types have usermax=0 — "
+            "Isaac Sim needs at least one sensor. Forcing camera usermax=1, min_count=0."
+        )
+        raw.setdefault("sensor_budget", {}).setdefault("camera", {})
+        raw["sensor_budget"]["camera"]["usermax"] = 1
+        raw["sensor_budget"]["camera"]["min_count"] = 0
+        # sync env vars so the bridge cell sees the corrected values
+        os.environ["SENSOR_CAMERA_MAX"] = "1"
+        os.environ["SENSOR_CAMERA_MIN"] = "0"
+
     _apply_sensor_budget_from_env(raw)
     is_isaac = str(_in(raw, "inner_loop", "mode") or "").lower() == "isaac_sim"
     if is_isaac:
