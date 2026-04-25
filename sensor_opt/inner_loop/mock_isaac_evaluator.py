@@ -10,16 +10,22 @@ import numpy as np
 
 from sensor_opt.encoding.config import SensorConfig
 from sensor_opt.evaluation.base import BaseEvaluator
-from sensor_opt.inner_loop.dummy_evaluator import evaluate as fast_evaluate
+from sensor_opt.inner_loop.baseline_metrics import fast_baseline_metrics
 from sensor_opt.loss.loss import EvalMetrics
 
 
 class MockIsaacEvaluator(BaseEvaluator):
     """Slow, stochastic evaluator placeholder for Isaac Sim."""
 
-    def __init__(self, latency_sec: float = 0.15, stochastic_std: float = 0.03):
+    def __init__(
+        self,
+        latency_sec: float = 0.15,
+        stochastic_std: float = 0.03,
+        baseline_noise_std: float = 0.01,
+    ):
         self.latency_sec = latency_sec
         self.stochastic_std = stochastic_std
+        self.baseline_noise_std = baseline_noise_std
 
     def run(
         self,
@@ -34,12 +40,12 @@ class MockIsaacEvaluator(BaseEvaluator):
         # Mimic simulator wall-clock delay.
         time.sleep(max(0.0, self.latency_sec))
 
-        base = fast_evaluate(
+        base = fast_baseline_metrics(
             config=config,
             sensor_models=sensor_models,
             n_episodes=n_episodes,
-            noise_std=0.01,
             rng=rng,
+            noise_std=self.baseline_noise_std,
         )
 
         # Add extra variance to mimic scenario stochasticity in physics-based sim.
@@ -52,6 +58,42 @@ class MockIsaacEvaluator(BaseEvaluator):
             mean_goal_success=success,
             n_episodes=n_episodes,
         )
+
+    def run_batch(
+        self,
+        configs: list[SensorConfig],
+        sensor_models: dict,
+        n_episodes: int = 15,
+        rng: np.random.Generator | None = None,
+    ) -> list[EvalMetrics]:
+        # Mock "batched" mode: still sequential, but matches the interface that
+        # a real Isaac Sim backend would implement (e.g., vectorized envs).
+        return [
+            self.run(config=c, sensor_models=sensor_models, n_episodes=n_episodes, rng=rng)
+            for c in configs
+        ]
+
+
+def evaluate(
+    config: SensorConfig,
+    sensor_models: dict,
+    n_episodes: int = 15,
+    noise_std: float = 0.0,
+    rng: np.random.Generator | None = None,
+    latency_sec: float = 0.15,
+    stochastic_std: float = 0.03,
+) -> EvalMetrics:
+    """
+    Backwards-compatible function API (mirrors the old dummy evaluator shape).
+    `noise_std` maps to the baseline analytic noise; stochastic_std adds extra
+    Isaac-like variability.
+    """
+    evaluator = MockIsaacEvaluator(
+        latency_sec=latency_sec,
+        stochastic_std=stochastic_std,
+        baseline_noise_std=float(noise_std),
+    )
+    return evaluator.run(config=config, sensor_models=sensor_models, n_episodes=n_episodes, rng=rng)
 
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:

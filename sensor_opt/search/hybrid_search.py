@@ -10,9 +10,9 @@ from sensor_opt.cma.outer_loop import OptimizationResult, run_cma_optimization
 from sensor_opt.cma.pareto import pareto_front
 from sensor_opt.design.config import DesignConfig, build_design_config
 from sensor_opt.evaluation.results import EvaluationResult
-from sensor_opt.loss.loss import EvalMetrics, compute_loss
+from sensor_opt.loss.loss import EvalMetrics, compute_loss, loss_weight_dict
 from sensor_opt.search.base import BaseSearch
-from sensor_opt.search.encoding import ConfigEncoder
+from sensor_opt.search.encoding import make_config_encoder
 
 try:
     from sklearn.gaussian_process import GaussianProcessRegressor
@@ -64,7 +64,7 @@ class HybridSearch(BaseSearch):
             records.append(_Record(design=design, result=result, score=self._scalarize(result)))
 
         model = self._make_model()
-        encoder = ConfigEncoder(cfg["mounting_slots"], cfg["sensor_budget"])
+        encoder = make_config_encoder(cfg)
 
         X = np.stack([encoder.encode(r.design.sensors) for r in records], axis=0)
         y = np.array([r.score for r in records], dtype=float)
@@ -134,9 +134,10 @@ class HybridSearch(BaseSearch):
             metrics=metrics,
             config=sensor_cfg,
             sensor_models=self.config["sensor_models"],
-            weights={"alpha": loss_cfg["alpha"], "beta": loss_cfg["beta"], "gamma": loss_cfg["gamma"]},
+            weights=loss_weight_dict(loss_cfg),
             max_cost_usd=loss_cfg.get("max_cost_usd", 10_000.0),
             hardware_constraints=self.config.get("hardware", {}),
+            loss_mode=str(loss_cfg.get("mode", "default")),
         )
         return EvaluationResult(
             metrics=metrics,

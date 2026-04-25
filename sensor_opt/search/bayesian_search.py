@@ -9,9 +9,9 @@ from sensor_opt.cma.outer_loop import OptimizationResult
 from sensor_opt.cma.pareto import pareto_front
 from sensor_opt.design.config import DesignConfig, build_design_config
 from sensor_opt.evaluation.results import EvaluationResult
-from sensor_opt.loss.loss import EvalMetrics, compute_loss
+from sensor_opt.loss.loss import EvalMetrics, compute_loss, loss_weight_dict
 from sensor_opt.search.base import BaseSearch
-from sensor_opt.search.encoding import ConfigEncoder
+from sensor_opt.search.encoding import make_config_encoder
 
 try:
     from sklearn.gaussian_process import GaussianProcessRegressor
@@ -40,7 +40,7 @@ class BayesianSearch(BaseSearch):
         rng = np.random.default_rng(seed)
         logger = self.evaluator.get("logger")
 
-        encoder = ConfigEncoder(cfg["mounting_slots"], cfg["sensor_budget"])
+        encoder = make_config_encoder(cfg)
         samples: List[_EvalRecord] = [self._random_record(rng, encoder) for _ in range(init_samples)]
         model = self._make_model()
 
@@ -129,9 +129,10 @@ class BayesianSearch(BaseSearch):
             metrics=metrics,
             config=sensor_cfg,
             sensor_models=self.config["sensor_models"],
-            weights={"alpha": loss_cfg["alpha"], "beta": loss_cfg["beta"], "gamma": loss_cfg["gamma"]},
+            weights=loss_weight_dict(loss_cfg),
             max_cost_usd=loss_cfg.get("max_cost_usd", 10_000.0),
             hardware_constraints=self.config.get("hardware", {}),
+            loss_mode=str(loss_cfg.get("mode", "default")),
         )
         return EvaluationResult(
             metrics=metrics,

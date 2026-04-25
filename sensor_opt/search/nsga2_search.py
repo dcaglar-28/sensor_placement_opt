@@ -8,9 +8,14 @@ import numpy as np
 from sensor_opt.cma.outer_loop import OptimizationResult
 from sensor_opt.cma.pareto import ParetoPoint, pareto_front
 from sensor_opt.design.config import DesignConfig, build_design_config
-from sensor_opt.encoding.config import SensorConfig, config_vector_size, decode
+from sensor_opt.encoding.config import (
+    SensorConfig,
+    config_vector_size,
+    decode,
+    reapply_default_geometry,
+)
 from sensor_opt.evaluation.results import EvaluationResult
-from sensor_opt.loss.loss import EvalMetrics, compute_loss
+from sensor_opt.loss.loss import EvalMetrics, compute_loss, loss_weight_dict
 from sensor_opt.search.base import BaseSearch
 
 
@@ -82,11 +87,20 @@ class NSGA2Search(BaseSearch):
     def _initial_population(self, pop_size: int, rng: np.random.Generator) -> List[DesignConfig]:
         budget = self.config["sensor_budget"]
         slots = self.config["mounting_slots"]
-        dim = config_vector_size(budget)
+        fix_g = bool(self.config.get("fixed_sensor_geometry", False))
+        fmo = bool(self.config.get("fixed_mount_order", False)) or fix_g
+        dim = config_vector_size(budget, fix_g)
         pop: List[DesignConfig] = []
         for _ in range(pop_size):
             vec = rng.uniform(-1.0, 3.5, size=dim)
-            sensor_cfg = decode(vec, slots, budget)
+            sensor_cfg = decode(
+                vec,
+                slots,
+                budget,
+                fixed_mount_order=fmo,
+                fixed_sensor_geometry=fix_g,
+                default_sensor_pose=self.config.get("default_sensor_pose", {}) or {},
+            )
             pop.append(build_design_config(sensor_cfg, self.config))
         return pop
 
@@ -118,9 +132,10 @@ class NSGA2Search(BaseSearch):
             metrics=metrics,
             config=sensor_cfg,
             sensor_models=self.config["sensor_models"],
-            weights={"alpha": loss_cfg["alpha"], "beta": loss_cfg["beta"], "gamma": loss_cfg["gamma"]},
+            weights=loss_weight_dict(loss_cfg),
             max_cost_usd=loss_cfg.get("max_cost_usd", 10_000.0),
             hardware_constraints=self.config.get("hardware", {}),
+            loss_mode=str(loss_cfg.get("mode", "default")),
         )
         return EvaluationResult(
             metrics=metrics,
@@ -204,11 +219,14 @@ class NSGA2Search(BaseSearch):
 
     def _make_offspring(self, parents: List[DesignConfig], count: int, rng: np.random.Generator) -> List[DesignConfig]:
         out: List[DesignConfig] = []
+        fix_g = bool(self.config.get("fixed_sensor_geometry", False))
+        pose = self.config.get("default_sensor_pose", {}) or {}
         for _ in range(count):
             p1 = parents[int(rng.integers(0, len(parents)))]
             p2 = parents[int(rng.integers(0, len(parents)))]
             child_sensor = self._crossover(p1.sensors, p2.sensors, rng)
             child_sensor = self._mutate(child_sensor, rng)
+            child_sensor = reapply_default_geometry(child_sensor, pose, fix_g)
             out.append(build_design_config(child_sensor, self.config))
         return out
 
@@ -233,17 +251,18 @@ class NSGA2Search(BaseSearch):
 
     def _mutate(self, cfg: SensorConfig, rng: np.random.Generator) -> SensorConfig:
         budget = self.config["sensor_budget"]
+        fix_g = bool(self.config.get("fixed_sensor_geometry", False))
         allowed_types = list(budget.keys()) + ["disabled"]
         for sensor in cfg.sensors:
-            if rng.random() < 0.35:
+            if not fix_g and rng.random() < 0.35:
                 sensor.x_offset = float(np.clip(sensor.x_offset + rng.normal(0.0, 0.08), -0.5, 0.5))
                 sensor.y_offset = float(np.clip(sensor.y_offset + rng.normal(0.0, 0.08), -0.5, 0.5))
                 sensor.z_offset = float(np.clip(sensor.z_offset + rng.normal(0.0, 0.05), 0.0, 0.5))
             if rng.random() < 0.20:
                 sensor.sensor_type = str(allowed_types[int(rng.integers(0, len(allowed_types)))])
-            if rng.random() < 0.15:
+            if not fix_g and rng.random() < 0.15:
                 sensor.range_fraction = float(np.clip(sensor.range_fraction + rng.normal(0.0, 0.1), 0.1, 1.0))
-            if rng.random() < 0.15:
+            if not fix_g and rng.random() < 0.15:
                 sensor.hfov_fraction = float(np.clip(sensor.hfov_fraction + rng.normal(0.0, 0.1), 0.2, 1.0))
         # Enforce simple add/remove pressure via random disable/enable toggles.
         if cfg.sensors and rng.random() < 0.15:

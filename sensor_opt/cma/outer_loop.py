@@ -21,13 +21,15 @@ import numpy as np
 from sensor_opt.cma.pareto import ParetoPoint, pareto_front
 from sensor_opt.encoding.config import (
     SensorConfig,
+    config_vector_size,
     decode,
+    floats_per_sensor,
     make_initial_vector,
 )
 from sensor_opt.evaluation.base import BaseEvaluator
 from sensor_opt.evaluation.pipeline import Evaluator
 from sensor_opt.evaluation.results import EvaluationResult
-from sensor_opt.loss.loss import EvalMetrics, LossResult, compute_loss
+from sensor_opt.loss.loss import EvalMetrics, LossResult, compute_loss, loss_weight_dict
 from sensor_opt.logging.experiment_logger import ExperimentLogger
 
 
@@ -56,14 +58,33 @@ def run_outer_loop(
 
     sensor_budget  = cfg["sensor_budget"]
     mounting_slots = cfg["mounting_slots"]
+    # `fixed_sensor_geometry` only shrinks the CMA search vector (type+active / mount); it does not
+    # change `loss`, `loss_cfg`, or `hardware`—those are always applied in `compute_loss` / eval.
+    fix_geometry   = bool(cfg.get("fixed_sensor_geometry", False))
+    fixed_mount    = bool(cfg.get("fixed_mount_order", False)) or fix_geometry
+    decode_kw = {
+        "fixed_mount_order": fixed_mount,
+        "fixed_sensor_geometry": fix_geometry,
+        "default_sensor_pose": cfg.get("default_sensor_pose", {}) or {},
+    }
+    fper = floats_per_sensor(fix_geometry)
     sensor_models  = cfg["sensor_models"]
     cma_cfg        = cfg["cma"]
     loss_cfg       = cfg["loss"]
+    loss_mode      = str(loss_cfg.get("mode", "default"))
     inner_cfg      = cfg["inner_loop"]
 
-    x0  = make_initial_vector(sensor_budget, mounting_slots)
+    n_expected = config_vector_size(sensor_budget, fix_geometry)
+    x0 = make_initial_vector(sensor_budget, mounting_slots, fix_geometry)
+    if cma_cfg.get("x0") is not None:
+        x0 = np.asarray(cma_cfg["x0"], dtype=np.float64)
+        if x0.shape != (n_expected,):
+            raise ValueError(
+                f'cma["x0"] has length {x0.size}, expected {n_expected} '
+                f"(config_vector_size for current sensor_budget)."
+            )
     dim = len(x0)
-    print(f"[CMA-ES] Vector dimension: {dim} ({dim // 10} sensor slots × 10 params)")
+    print(f"[CMA-ES] Vector dimension: {dim} ({dim // fper} sensor slots × {fper} params)")
 
     pop_size = cma_cfg.get("population_size", None)
     cma_options = {
@@ -75,6 +96,9 @@ def run_outer_loop(
     }
     if pop_size is not None:
         cma_options["popsize"] = pop_size
+    for _opt in ("tolfunhist", "tolfunrel"):
+        if _opt in cma_cfg:
+            cma_options[_opt] = cma_cfg[_opt]
 
     es = cma.CMAEvolutionStrategy(x0, float(cma_cfg.get("sigma0", 0.3)), cma_options)
 
@@ -84,6 +108,7 @@ def run_outer_loop(
     generation  = 0
     global_configs: List[SensorConfig] = []
     global_objectives: List[dict] = []
+    eval_generations: List[int] = []
 
     noise_std  = inner_cfg.get("dummy", {}).get("noise_std", 0.05)
     n_episodes = inner_cfg.get("n_episodes", 15)
@@ -97,59 +122,96 @@ def run_outer_loop(
         eval_times: List[float] = []
         fidelities: List[str] = []
 
-        for vec in solutions:
-            config = decode(vec, mounting_slots, sensor_budget)
+        configs = [decode(vec, mounting_slots, sensor_budget, **decode_kw) for vec in solutions]
 
+        # Batched path: if we have a BaseEvaluator (fast/mid/slow) provided directly,
+        # use its run_batch hook to evaluate the entire population.
+        if evaluator is None and base_evaluator is not None and evaluator_fn is None:
             try:
-                eval_result = _evaluate_candidate(
-                    config=config,
-                    cfg=cfg,
+                metrics_list = base_evaluator.run_batch(
+                    configs=configs,
                     sensor_models=sensor_models,
-                    loss_cfg=loss_cfg,
                     n_episodes=n_episodes,
-                    noise_std=noise_std,
                     rng=rng,
-                    evaluator_fn=evaluator_fn,
-                    evaluator=evaluator,
-                    base_evaluator=base_evaluator,
                 )
+                for config, metrics in zip(configs, metrics_list):
+                    lr = compute_loss(
+                        metrics=metrics,
+                        config=config,
+                        sensor_models=sensor_models,
+                        weights=loss_weight_dict(loss_cfg),
+                        max_cost_usd=loss_cfg.get("max_cost_usd", 10_000.0),
+                        hardware_constraints=cfg.get("hardware", {}),
+                        loss_mode=loss_mode,
+                    )
+                    losses.append(lr.total)
+                    loss_results.append(lr)
+                    eval_times.append(0.0)
+                    fidelities.append("batched")
+                    global_configs.append(config)
+                    global_objectives.append(dict(lr.objectives or {}))
+                    eval_generations.append(generation)
             except Exception as e:
-                print(f"[CMA-ES] Evaluator error: {e}")
+                print(f"[CMA-ES] Batched evaluator error: {e}")
                 traceback.print_exc()
-                fallback_metrics = EvalMetrics(
-                    collision_rate=1.0,
-                    blind_spot_fraction=1.0,
-                    mean_goal_success=0.0,
-                    n_episodes=n_episodes,
-                )
-                fallback_lr = compute_loss(
-                    metrics=fallback_metrics,
-                    config=config,
-                    sensor_models=sensor_models,
-                    weights={
-                        "alpha": loss_cfg["alpha"],
-                        "beta":  loss_cfg["beta"],
-                        "gamma": loss_cfg["gamma"],
-                    },
-                    max_cost_usd=loss_cfg.get("max_cost_usd", 10_000.0),
-                    hardware_constraints=cfg.get("hardware", {}),
-                )
-                eval_result = EvaluationResult(
-                    metrics=fallback_metrics,
-                    loss=fallback_lr,
-                    objectives=dict(fallback_lr.objectives or {}),
-                    fidelity="fallback",
-                    evaluation_time_sec=0.0,
-                )
+                # Fall back to the scalar evaluation path below.
+                losses.clear()
+                loss_results.clear()
+                eval_times.clear()
+                fidelities.clear()
+                global_configs = global_configs[:-len(configs)]
+                global_objectives = global_objectives[:-len(configs)]
+                eval_generations = eval_generations[:-len(configs)]
 
-            lr = eval_result.loss
-            losses.append(lr.total)
-            loss_results.append(lr)
-            eval_times.append(float(eval_result.evaluation_time_sec))
-            fidelities.append(eval_result.fidelity)
+        if not losses:
+            for config in configs:
+                try:
+                    eval_result = _evaluate_candidate(
+                        config=config,
+                        cfg=cfg,
+                        sensor_models=sensor_models,
+                        loss_cfg=loss_cfg,
+                        n_episodes=n_episodes,
+                        noise_std=noise_std,
+                        rng=rng,
+                        evaluator_fn=evaluator_fn,
+                        evaluator=evaluator,
+                        base_evaluator=base_evaluator,
+                    )
+                except Exception as e:
+                    print(f"[CMA-ES] Evaluator error: {e}")
+                    traceback.print_exc()
+                    fallback_metrics = EvalMetrics(
+                        collision_rate=1.0,
+                        blind_spot_fraction=1.0,
+                        mean_goal_success=0.0,
+                        n_episodes=n_episodes,
+                    )
+                    fallback_lr = compute_loss(
+                        metrics=fallback_metrics,
+                        config=config,
+                        sensor_models=sensor_models,
+                        weights=loss_weight_dict(loss_cfg),
+                        max_cost_usd=loss_cfg.get("max_cost_usd", 10_000.0),
+                        hardware_constraints=cfg.get("hardware", {}),
+                        loss_mode=loss_mode,
+                    )
+                    eval_result = EvaluationResult(
+                        metrics=fallback_metrics,
+                        loss=fallback_lr,
+                        objectives=dict(fallback_lr.objectives or {}),
+                        fidelity="fallback",
+                        evaluation_time_sec=0.0,
+                    )
 
-            global_configs.append(config)
-            global_objectives.append(dict(eval_result.objectives))
+                lr = eval_result.loss
+                losses.append(lr.total)
+                loss_results.append(lr)
+                eval_times.append(float(eval_result.evaluation_time_sec))
+                fidelities.append(eval_result.fidelity)
+                global_configs.append(config)
+                global_objectives.append(dict(eval_result.objectives))
+                eval_generations.append(generation)
 
         es_losses = list(losses)
         if es_losses and float(np.max(es_losses) - np.min(es_losses)) == 0.0:
@@ -167,7 +229,12 @@ def run_outer_loop(
 
         if gen_best_loss < best_loss:
             best_loss   = gen_best_loss
-            best_config = decode(solutions[gen_best_idx], mounting_slots, sensor_budget)
+            best_config = decode(
+                solutions[gen_best_idx],
+                mounting_slots,
+                sensor_budget,
+                **decode_kw,
+            )
             best_result = gen_best_lr
 
         log_every = cfg.get("logging", {}).get("log_every_n_generations", 1)
@@ -196,6 +263,17 @@ def run_outer_loop(
 
     final_pareto = pareto_front(global_configs, global_objectives)
     print(f"[CMA-ES] Pareto-front size: {len(final_pareto)}")
+
+    try:
+        logger.log_paper_artifacts(
+            global_configs=global_configs,
+            global_objectives=global_objectives,
+            eval_generations=eval_generations,
+            pareto_front=final_pareto,
+            cfg=cfg,
+        )
+    except Exception as e:
+        print(f"[CMA-ES] Could not write paper JSON artifacts: {e}")
 
     return OptimizationResult(
         best_config=best_config,
@@ -270,13 +348,10 @@ def _evaluate_candidate(
         metrics=metrics,
         config=config,
         sensor_models=sensor_models,
-        weights={
-            "alpha": loss_cfg["alpha"],
-            "beta":  loss_cfg["beta"],
-            "gamma": loss_cfg["gamma"],
-        },
+        weights=loss_weight_dict(loss_cfg),
         max_cost_usd=loss_cfg.get("max_cost_usd", 10_000.0),
         hardware_constraints=cfg.get("hardware", {}),
+        loss_mode=str(loss_cfg.get("mode", "default")),
     )
     return EvaluationResult(
         metrics=metrics,
